@@ -109,7 +109,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
             attn_weights = torch.max(attn_weights, torch.tensor(torch.finfo(attn_weights.dtype).min))
 
 
-        if self.attention_masks_next is not None:
+        if self.attention_masks_next is not None and query_states.shape[2] == 1:
             attn_weights = attn_weights * self.attention_masks_next + (1 - self.attention_masks_next) * torch.finfo(attn_weights.dtype).min
 
         # upcast attention to fp32
@@ -123,7 +123,7 @@ class LlamaAttention_heavy_hitter(nn.Module):
         # offset = attn_weights.gt(0).sum(0).sum(1)
 
         # Accumulate attention scores
-        if not self.previous_scores == None:
+        if not self.previous_scores == None and query_states.shape[2] == 1:
             current_scores_sum[:, :-1] += self.previous_scores #(Enlarged Sequence)
         else:
             self.heavy_budget = int(self.heavy_budget_ratio * current_scores_sum.shape[-1])
