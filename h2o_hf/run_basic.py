@@ -11,9 +11,9 @@ import numpy as np
 from transformers import LlamaConfig
 import copy
 
-from utils_hh.modify_llama import convert_kvcache_llama_heavy_recent, LlamaAttention_heavy_hitter
-from utils_hh.modify_gptneox import convert_kvcache_gpt_neox_heavy_recent, GPTNeoXAttention_Mask
-from utils_hh.modify_opt import convert_kvcache_opt_heavy_recent, OPTAttention_Mask
+from utils_hh.modify_llama_new import convert_kvcache_llama_heavy_recent
+# from utils_hh.modify_gptneox import convert_kvcache_gpt_neox_heavy_recent, GPTNeoXAttention_Mask
+# from utils_hh.modify_opt import convert_kvcache_opt_heavy_recent, OPTAttention_Mask
 
 dataset_path = "/nfs/shared_LLM_dataset/LongBench/LongBench.py"
 MODEL_PATH = "/nfs/shared_LLM_model/meta-llama/Llama-2-7b-chat-hf"
@@ -26,8 +26,8 @@ model2maxlen = json.load(open("config/model2maxlen.json"))
 
 ENABLE_Heavy_Hitter_FUNCTIONS = {
     "llama": convert_kvcache_llama_heavy_recent,
-    "opt": convert_kvcache_opt_heavy_recent,
-    "gpt_neox": convert_kvcache_gpt_neox_heavy_recent,
+    # "opt": convert_kvcache_opt_heavy_recent,
+    # "gpt_neox": convert_kvcache_gpt_neox_heavy_recent,
 }
 
 
@@ -63,46 +63,46 @@ def post_process(response, model_name):
     return response
 
 
-# datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
-#             "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
-#             "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
-datasets = ["gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
+datasets = ["narrativeqa", "qasper", "multifieldqa_en", "multifieldqa_zh", "hotpotqa", "2wikimqa", "musique", \
+            "dureader", "gov_report", "qmsum", "multi_news", "vcsum", "trec", "triviaqa", "samsum", "lsht", \
             "passage_count", "passage_retrieval_en", "passage_retrieval_zh", "lcc", "repobench-p"]
+datasets = ["narrativeqa"]
 
 model_name = "llama2-7b-chat-4k"
 
 print("Begin Load Config and model and so on")
 
-config = LlamaConfig.from_pretrained(MODEL_PATH)
-config.heavy_ratio = 0.1
-config.recent_ratio = 0.1
+# config = LlamaConfig.from_pretrained(MODEL_PATH)
+# config.heavy_ratio = 0.1
+# config.recent_ratio = 0.1
 
 # replace_llama_attn_with_flash_attn()
-tokenizer = LlamaTokenizer.from_pretrained(MODEL_PATH, use_fast=True)
+tokenizer = LlamaTokenizer.from_pretrained(MODEL_PATH)
 model = LlamaForCausalLM.from_pretrained(MODEL_PATH,
-                                         torch_dtype=torch.float16).to(device)
+                                         torch_dtype=torch.float16)
 model = model.eval()
+config = model.config
+config.heavy_ratio = 0.1
+config.recent_ratio = 0.1
 max_length = model2maxlen[model_name]
-
-print("Begin")
+print("Begin to create H2O model")
 
 checkpoint = copy.deepcopy(model.state_dict())
 model = ENABLE_Heavy_Hitter_FUNCTIONS['llama'](model, config)
 model.load_state_dict(checkpoint)
-
 model = model.to(torch.float16).eval().to(device)
+
 print(torch.cuda.max_memory_allocated())
 print(torch.cuda.max_memory_reserved())
 torch.cuda.empty_cache()
-print("finish init")
-
-# datasets = ["narrativeqa"]
+print("finish init, begin infer")
 
 
 def get_pred(device, data, max_length, max_gen, prompt_format, dataset,
              model_name, model, tokenizer, out_path):
     infer_time = []
     infer_count = []
+    g_time_list = []
     for json_obj in tqdm(data):
         prompt = prompt_format.format(**json_obj)
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
@@ -139,6 +139,7 @@ def get_pred(device, data, max_length, max_gen, prompt_format, dataset,
             input = tokenizer(prompt, truncation=False,
                               return_tensors="pt").to(device)
         context_length = input.input_ids.shape[-1]
+        g_b_time = time.time()
         if dataset == "samsum":  # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
             output = model.generate(
                 **input,
@@ -160,15 +161,21 @@ def get_pred(device, data, max_length, max_gen, prompt_format, dataset,
                 do_sample=False,
                 temperature=1.0,
             )[0]
+        g_e_time = time.time()
+        g_time_list.append(g_e_time - g_b_time)
+        # if len(g_time_list) > 10:
+        #     print(g_time_list)
+        #     print("avg", np.mean(g_time_list))
+        #     return
         pred = tokenizer.decode(output[context_length:],
                                 skip_special_tokens=True)
         end_time = time.time()
 
         infer_time.append(end_time - start_time)
-        infer_count.append(json_obj["length"])
+        infer_count.append(output.numel())
 
         pred = post_process(pred, model_name)
-        with open(out_path, "w", encoding="utf-8") as f:
+        with open(out_path, "a", encoding="utf-8") as f:
             json.dump(
                 {
                     "pred": pred,
@@ -181,6 +188,7 @@ def get_pred(device, data, max_length, max_gen, prompt_format, dataset,
             f.write('\n')
 
     print("infer_time:", np.sum(infer_time[5:]))
+    print("generate_time:", np.sum(g_time_list[5:]))
     print("infer_TPOT:", np.mean(infer_time[5:]) / np.mean(infer_count[5:]))
 
 
@@ -200,3 +208,4 @@ for dataset in datasets:
     print("Max Reserved", torch.cuda.max_memory_reserved())
     print(f"time: {end - begin}")
     torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
